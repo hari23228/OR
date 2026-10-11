@@ -66,6 +66,7 @@ class DatasetStore:
     frame: pd.DataFrame | None = None
     latency: LatencyConfig = field(default_factory=LatencyConfig)
     results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    latest_routing_strategy: str | None = None
     sensitivity: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -223,6 +224,22 @@ def require_dataset() -> pd.DataFrame:
     return store.frame
 
 
+def clear_results() -> None:
+    store.results.clear()
+    store.sensitivity.clear()
+    store.latest_routing_strategy = None
+
+
+def get_routing_export_rows(strategy: str = "latest") -> list[dict[str, Any]]:
+    routing_strategy = store.latest_routing_strategy if strategy == "latest" else strategy
+    if routing_strategy is None:
+        raise HTTPException(404, "There is no successful routing result to export yet.")
+    result = store.results.get(routing_strategy)
+    if not result or "routing" not in result:
+        raise HTTPException(404, f"No saved routing exists for strategy '{routing_strategy}'.")
+    return result["routing"]
+
+
 def with_latency(frame: pd.DataFrame) -> pd.DataFrame:
     config = store.latency
     copied = frame.copy()
@@ -376,8 +393,7 @@ async def upload(files: list[UploadFile] = File(...)):
     frame, validation = validate_and_align(rows)
     if validation["valid"]:
         store.frame = frame
-        store.results.clear()
-        store.sensitivity.clear()
+        clear_results()
     return {"validation": validation, "files": file_details}
 
 
@@ -393,8 +409,7 @@ def load_sample():
     if not validation["valid"]:
         return {"validation": validation}
     store.frame = frame
-    store.results.clear()
-    store.sensitivity.clear()
+    clear_results()
     return {"validation": validation}
 
 
@@ -425,6 +440,8 @@ def configure_latency(config: LatencyConfig):
 def optimize_ilp(request: IlpRequest):
     result = solve_ilp(request.minimum_quality, request.maximum_average_latency)
     store.results["ilp"] = result
+    if result.get("status") == "Optimal" and "routing" in result:
+        store.latest_routing_strategy = "ilp"
     return result
 
 
@@ -432,6 +449,8 @@ def optimize_ilp(request: IlpRequest):
 def optimize_goal(request: GoalRequest):
     result = solve_goal(request)
     store.results["goal"] = result
+    if result.get("status") == "Optimal" and "routing" in result:
+        store.latest_routing_strategy = "goal"
     return result
 
 
@@ -495,10 +514,11 @@ def sensitivity(request: SensitivityRequest):
 
 
 @app.get("/export")
-def export(kind: Literal["routing", "comparison", "sensitivity", "summary"] = "routing", strategy: str = "ilp"):
+def export(kind: Literal["routing", "comparison", "sensitivity", "summary"] = "routing", strategy: str = "latest"):
     if kind == "routing":
-        rows = store.results.get(strategy, {}).get("routing", [])
-        filename = f"{strategy}-routing.csv"
+        rows = get_routing_export_rows(strategy)
+        strategy_name = store.latest_routing_strategy if strategy == "latest" else strategy
+        filename = f"{strategy_name}-routing.csv"
     elif kind == "comparison":
         rows = comparison()["comparison"]
         filename = "strategy-comparison.csv"
